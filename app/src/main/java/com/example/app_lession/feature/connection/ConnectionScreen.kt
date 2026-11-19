@@ -1,6 +1,5 @@
 package com.example.app_lession.feature.connection
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -28,23 +27,27 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import com.example.app_lession.core.ble.BleConnectionState
 import com.example.app_lession.core.ble.BleDiscoveredDevice
 import com.example.app_lession.core.model.EmgSample
+import com.example.app_lession.core.session.EmgSession
+import com.example.app_lession.core.ui.EmgLineChart
+import com.example.app_lession.feature.sessions.SessionViewModel
 
 @Composable
 fun ConnectionScreen(
     viewModel: ConnectionViewModel,
+    sessionViewModel: SessionViewModel,
     onRequestPermissions: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val connection by viewModel.connectionState.collectAsState()
     val liveMeasurements by viewModel.liveMeasurementState.collectAsState()
+    val activeSession by sessionViewModel.activeSession.collectAsState()
+    val sessionBusy by sessionViewModel.isBusy.collectAsState()
+    val sessionInitializing by sessionViewModel.isInitializing.collectAsState()
+    val sessionError by sessionViewModel.errorMessage.collectAsState()
 
     Column(
         modifier = modifier
@@ -96,6 +99,14 @@ fun ConnectionScreen(
         MeasurementCard(liveMeasurements)
         Spacer(Modifier.height(16.dp))
         EmgChartCard(liveMeasurements.history)
+        Spacer(Modifier.height(16.dp))
+        SessionControlCard(
+            activeSession = activeSession,
+            enabled = !sessionBusy && !sessionInitializing,
+            errorMessage = sessionError,
+            onStart = sessionViewModel::startSession,
+            onFinish = sessionViewModel::finishSession
+        )
 
         if (connection.discoveredDevices.isNotEmpty()) {
             Spacer(Modifier.height(16.dp))
@@ -160,6 +171,46 @@ fun ConnectionScreen(
                 OutlinedButton(onClick = viewModel::disconnect) {
                     Text("Cancelar")
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SessionControlCard(
+    activeSession: EmgSession?,
+    enabled: Boolean,
+    errorMessage: String?,
+    onStart: () -> Unit,
+    onFinish: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) {
+        Column(Modifier.padding(20.dp)) {
+            Text(
+                if (activeSession == null) "Sesión de medición" else "Sesión en curso",
+                style = MaterialTheme.typography.titleMedium
+            )
+            if (activeSession != null) {
+                Spacer(Modifier.height(4.dp))
+                Text("Muestras guardadas: ${activeSession.sampleCount}")
+            }
+            errorMessage?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(it, color = MaterialTheme.colorScheme.error)
+            }
+            Spacer(Modifier.height(12.dp))
+            Button(
+                onClick = if (activeSession == null) onStart else onFinish,
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (activeSession == null) "Iniciar sesión" else "Finalizar sesión")
             }
         }
     }
@@ -267,65 +318,13 @@ private fun EmgChartCard(samples: List<EmgSample>) {
                         .height(160.dp)
                 )
             } else {
-                EmgLineChart(samples)
+                EmgLineChart(samples, visibleWindowMillis = CHART_WINDOW_MS)
             }
         }
     }
 }
 
-@Composable
-private fun EmgLineChart(samples: List<EmgSample>) {
-    val lineColor = MaterialTheme.colorScheme.primary
-    val gridColor = MaterialTheme.colorScheme.outlineVariant
-    Canvas(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(160.dp)
-    ) {
-        val latestTime = samples.last().receivedAtEpochMillis
-        val chartStartTime = latestTime - CHART_WINDOW_MS
-
-        for (step in 0..4) {
-            val y = size.height * step / 4f
-            drawLine(
-                color = gridColor,
-                start = Offset(0f, y),
-                end = Offset(size.width, y),
-                strokeWidth = 1.dp.toPx()
-            )
-        }
-
-        val visibleSamples = samples.filter {
-            it.receivedAtEpochMillis >= chartStartTime
-        }
-        val path = Path()
-        visibleSamples.forEachIndexed { index, sample ->
-            val x = (
-                (sample.receivedAtEpochMillis - chartStartTime).toFloat() /
-                    CHART_WINDOW_MS
-                ).coerceIn(0f, 1f) * size.width
-            val y = size.height * (1f - sample.adcValue / MAX_ADC_VALUE)
-            if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
-        }
-        drawPath(
-            path = path,
-            color = lineColor,
-            style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
-        )
-        if (visibleSamples.size == 1) {
-            val sample = visibleSamples.single()
-            val x = (
-                (sample.receivedAtEpochMillis - chartStartTime).toFloat() /
-                    CHART_WINDOW_MS
-                ).coerceIn(0f, 1f) * size.width
-            val y = size.height * (1f - sample.adcValue / MAX_ADC_VALUE)
-            drawCircle(color = lineColor, radius = 4.dp.toPx(), center = Offset(x, y))
-        }
-    }
-}
-
 private const val CHART_WINDOW_MS = 6_000L
-private const val MAX_ADC_VALUE = 4095f
 
 private fun connectionLabel(state: BleConnectionState): String = when (state) {
     BleConnectionState.DISCONNECTED -> "Desconectado"

@@ -23,6 +23,8 @@ import androidx.compose.ui.res.painterResource
 import androidx.lifecycle.ViewModelProvider
 import com.example.app_lession.feature.connection.ConnectionScreen
 import com.example.app_lession.feature.connection.ConnectionViewModel
+import com.example.app_lession.feature.sessions.SessionScreen
+import com.example.app_lession.feature.sessions.SessionViewModel
 import com.example.app_lession.ui.theme.AppLessionTheme
 
 class MainActivity : ComponentActivity() {
@@ -31,6 +33,16 @@ class MainActivity : ComponentActivity() {
             this,
             ConnectionViewModel.Factory(applicationContext)
         )[ConnectionViewModel::class.java]
+    }
+
+    private val sessionViewModel: SessionViewModel by lazy {
+        ViewModelProvider(
+            this,
+            SessionViewModel.Factory(
+                applicationContext,
+                connectionViewModel.measurements
+            )
+        )[SessionViewModel::class.java]
     }
 
     private val bluetoothPermissionLauncher =
@@ -51,6 +63,7 @@ class MainActivity : ComponentActivity() {
             AppLessionTheme {
                 AppLessionApp(
                     viewModel = connectionViewModel,
+                    sessionViewModel = sessionViewModel,
                     onRequestBluetoothPermissions = ::requestBluetoothPermissions
                 )
             }
@@ -83,6 +96,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun AppLessionApp(
     viewModel: ConnectionViewModel,
+    sessionViewModel: SessionViewModel,
     onRequestBluetoothPermissions: () -> Unit
 ) {
     var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.HOME) }
@@ -108,7 +122,13 @@ fun AppLessionApp(
             if (currentDestination == AppDestinations.HOME) {
                 ConnectionScreen(
                     viewModel = viewModel,
+                    sessionViewModel = sessionViewModel,
                     onRequestPermissions = onRequestBluetoothPermissions,
+                    modifier = Modifier.padding(innerPadding)
+                )
+            } else if (currentDestination == AppDestinations.FAVORITES) {
+                SessionScreen(
+                    viewModel = sessionViewModel,
                     modifier = Modifier.padding(innerPadding)
                 )
             } else {
