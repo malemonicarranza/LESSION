@@ -38,6 +38,9 @@ class BleConnectionManager(context: Context) {
     private var scanner: BluetoothLeScanner? = null
     private var bluetoothGatt: BluetoothGatt? = null
     private var scanTimeout: Runnable? = null
+    private var connectionTimeout: Runnable? = null
+    private var connectionAttemptId = 0L
+    private val discoveredBluetoothDevices = linkedMapOf<String, BluetoothDevice>()
     private val lineBuffer = StringBuilder()
 
     private val _connectionState = MutableStateFlow(BleConnectionUiState())
@@ -57,21 +60,32 @@ class BleConnectionManager(context: Context) {
         .build()
 
     private val scanCallback = object : ScanCallback() {
+        @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
             val advertisedName = device.name ?: result.scanRecord?.deviceName
             val advertisesService = result.scanRecord?.serviceUuids
                 ?.any { it.uuid == BleUuids.SERVICE } == true
 
-            if (advertisedName == BleUuids.DEVICE_NAME || advertisesService) {
+            if (_connectionState.value.state != BleConnectionState.SEARCHING) return
+
+            // List named BLE devices and service advertisers. The UI marks
+            // devices that advertise the Lession service as preferred candidates.
+            if (advertisedName != null || advertisesService) {
+                discoveredBluetoothDevices[device.address] = device
+                val discovered = BleDiscoveredDevice(
+                    name = advertisedName,
+                    address = device.address,
+                    rssi = result.rssi,
+                    advertisesLessionService = advertisesService
+                )
                 Log.d(
                     tag,
-                    "Dispositivo BLE encontrado: name=" + advertisedName +
-                        ", address=" + device.address +
-                        ", serviceAdvertised=" + advertisesService
+                    "[SCAN] Dispositivo encontrado: name=${discovered.name}, " +
+                        "address=${discovered.address}, rssi=${discovered.rssi}, " +
+                        "serviceAdvertised=${discovered.advertisesLessionService}"
                 )
-                stopScanning(publishDisconnected = false)
-                connect(device)
+                publishDiscoveredDevice(discovered)
             }
         }
 
@@ -86,6 +100,20 @@ class BleConnectionManager(context: Context) {
             status: Int,
             newState: Int
         ) {
+            // Android may deliver callbacks from a GATT that was already closed.
+            // Never let a stale callback alter the current connection state.
+            if (bluetoothGatt !== gatt) {
+                Log.w(tag, "[GATT] Callback ignorado para una conexión anterior: ${gatt.device.address}")
+                closeGatt(gatt)
+                return
+            }
+
+            Log.d(
+                tag,
+                "[GATT] onConnectionStateChange address=${gatt.device.address}, " +
+                    "status=$status, newState=$newState, attempt=$connectionAttemptId"
+            )
+
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 closeGatt(gatt)
                 publishError("Falló la conexión GATT. Código: $status")
@@ -94,14 +122,17 @@ class BleConnectionManager(context: Context) {
 
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
+                    Log.d(tag, "[GATT] Conectado a nivel ACL; iniciando discoverServices()")
                     publishState(BleConnectionState.CONNECTING, gatt.device.name)
                     if (!gatt.discoverServices()) {
+                        Log.e(tag, "[GATT] discoverServices() devolvió false")
                         closeGatt(gatt)
                         publishError("No se pudo iniciar el descubrimiento de servicios.")
                     }
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
+                    Log.w(tag, "[GATT] Desconectado correctamente por el stack")
                     closeGatt(gatt)
                     lineBuffer.clear()
                     publishState(BleConnectionState.DISCONNECTED)
@@ -110,6 +141,12 @@ class BleConnectionManager(context: Context) {
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (bluetoothGatt !== gatt) {
+                Log.w(tag, "[GATT] onServicesDiscovered ignorado para conexión anterior")
+                closeGatt(gatt)
+                return
+            }
+            Log.d(tag, "[GATT] onServicesDiscovered status=$status")
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 closeGatt(gatt)
                 publishError("No se pudieron descubrir los servicios. Código: $status")
@@ -127,25 +164,56 @@ class BleConnectionManager(context: Context) {
                 }
             )
 
-            val service = gatt.getService(BleUuids.SERVICE)
-            val tx = service?.getCharacteristic(BleUuids.TX)
-            val rx = service?.getCharacteristic(BleUuids.RX)
-            val cccd = tx?.getDescriptor(BleUuids.CCCD)
+            // Some Android/MIUI Bluetooth stacks return null from
+            // getCharacteristic(UUID) even though the characteristic is present
+            // in the discovered list. Resolve from the actual list instead.
+            val service = gatt.services.firstOrNull { uuidMatches(it.uuid, BleUuids.SERVICE) }
+            val tx = service?.characteristics?.firstOrNull { uuidMatches(it.uuid, BleUuids.TX) }
+            val rx = service?.characteristics?.firstOrNull { uuidMatches(it.uuid, BleUuids.RX) }
+            val cccd = tx?.descriptors?.firstOrNull { uuidMatches(it.uuid, BleUuids.CCCD) }
 
-            if (service == null || tx == null || rx == null || cccd == null) {
-                Log.e(
-                    tag,
-                    "GATT incompleto: service=" + (service != null) +
-                        ", tx=" + (tx != null) +
-                        ", rx=" + (rx != null) +
-                        ", cccd=" + (cccd != null)
-                )
-                closeGatt(gatt)
-                publishError("El ESP32 no expone el servicio o las características esperadas.")
+            Log.d(
+                tag,
+                "[GATT] UUID esperados: service=${BleUuids.SERVICE}, " +
+                    "tx=${BleUuids.TX}, rx=${BleUuids.RX}, cccd=${BleUuids.CCCD}"
+            )
+            Log.d(
+                tag,
+                "[GATT] Resolución normalizada: service=${service != null}, " +
+                    "tx=${tx?.uuid}, rx=${rx?.uuid}, cccd=${cccd?.uuid}, " +
+                    "txProperties=${tx?.properties}, rxProperties=${rx?.properties}"
+            )
+
+            val validationErrors = buildList {
+                if (service == null) add("servicio ${BleUuids.SERVICE}")
+                if (tx == null) add("TX ${BleUuids.TX}")
+                if (rx == null) add("RX ${BleUuids.RX}")
+                if (cccd == null) add("CCCD ${BleUuids.CCCD}")
+                if (tx != null && tx.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0) {
+                    add("TX sin READ")
+                }
+                if (tx != null && tx.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY == 0) {
+                    add("TX sin NOTIFY")
+                }
+                if (rx != null &&
+                    rx.properties and
+                    (BluetoothGattCharacteristic.PROPERTY_WRITE or
+                        BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) == 0
+                ) {
+                    add("RX sin WRITE")
+                }
+            }
+
+            if (validationErrors.isNotEmpty()) {
+                val message = "GATT incompleto: ${validationErrors.joinToString()}."
+                Log.e(tag, "[GATT] $message")
+                disconnectAndCloseGatt(gatt)
+                publishError(message)
                 return
             }
 
-            enableTxNotifications(gatt, tx, cccd)
+            Log.d(tag, "[GATT] Servicio y propiedades verificadas correctamente")
+            enableTxNotifications(gatt, tx!!, cccd!!)
         }
 
         @Suppress("DEPRECATION")
@@ -154,9 +222,17 @@ class BleConnectionManager(context: Context) {
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
-            if (descriptor.uuid != BleUuids.CCCD) return
+            if (bluetoothGatt !== gatt) {
+                Log.w(tag, "[GATT] onDescriptorWrite ignorado para conexión anterior")
+                closeGatt(gatt)
+                return
+            }
+            if (!uuidMatches(descriptor.uuid, BleUuids.CCCD)) return
 
+            Log.d(tag, "[GATT] onDescriptorWrite CCCD status=$status")
             if (status == BluetoothGatt.GATT_SUCCESS) {
+                connectionTimeout?.let(mainHandler::removeCallbacks)
+                connectionTimeout = null
                 Log.d(tag, "CCCD TX habilitado correctamente")
                 publishState(BleConnectionState.CONNECTED, gatt.device.name)
             } else {
@@ -170,7 +246,9 @@ class BleConnectionManager(context: Context) {
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            if (characteristic.uuid == BleUuids.TX) {
+            if (bluetoothGatt !== gatt) return
+            if (uuidMatches(characteristic.uuid, BleUuids.TX)) {
+                Log.d(tag, "[GATT] Notificación TX recibida (${characteristic.value.size} bytes)")
                 processNotification(characteristic.value)
             }
         }
@@ -180,7 +258,9 @@ class BleConnectionManager(context: Context) {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            if (characteristic.uuid == BleUuids.TX) {
+            if (bluetoothGatt !== gatt) return
+            if (uuidMatches(characteristic.uuid, BleUuids.TX)) {
+                Log.d(tag, "[GATT] Notificación TX recibida (${value.size} bytes)")
                 processNotification(value)
             }
         }
@@ -208,8 +288,15 @@ class BleConnectionManager(context: Context) {
         }
 
         stopScanning(publishDisconnected = false)
-        closeGatt()
+        disconnectAndCloseGatt(bluetoothGatt)
+        discoveredBluetoothDevices.clear()
         lineBuffer.clear()
+        _connectionState.value = _connectionState.value.copy(
+            deviceName = null,
+            errorMessage = null,
+            discoveredDevices = emptyList(),
+            selectedDeviceAddress = null
+        )
 
         val bleScanner = adapter.bluetoothLeScanner
         if (bleScanner == null) {
@@ -244,6 +331,31 @@ class BleConnectionManager(context: Context) {
         }
     }
 
+    fun selectDevice(address: String) {
+        if (discoveredBluetoothDevices.containsKey(address) &&
+            _connectionState.value.state != BleConnectionState.CONNECTING &&
+            _connectionState.value.state != BleConnectionState.CONNECTED
+        ) {
+            Log.d(tag, "[SCAN] Dispositivo seleccionado: address=$address")
+            _connectionState.value = _connectionState.value.copy(
+                selectedDeviceAddress = address,
+                errorMessage = null
+            )
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun connectSelected() {
+        val address = _connectionState.value.selectedDeviceAddress
+        val device = address?.let(discoveredBluetoothDevices::get)
+        if (device == null) {
+            publishError("Seleccioná un dispositivo BLE antes de conectar.")
+            return
+        }
+        stopScanning(publishDisconnected = false)
+        connect(device)
+    }
+
     @SuppressLint("MissingPermission")
     private fun connect(device: BluetoothDevice) {
         if (!hasBlePermissions()) {
@@ -251,16 +363,47 @@ class BleConnectionManager(context: Context) {
             return
         }
 
+        // A single ESP32 client is supported. Close every previous GATT before
+        // creating a new one, including after an earlier failed attempt.
+        disconnectAndCloseGatt(bluetoothGatt)
+        lineBuffer.clear()
+        connectionAttemptId += 1
+        val attempt = connectionAttemptId
+        Log.d(tag, "[GATT] Abriendo conexión attempt=$attempt, address=${device.address}")
         publishState(
             BleConnectionState.CONNECTING,
             device.name ?: BleUuids.DEVICE_NAME
         )
-        bluetoothGatt = device.connectGatt(
-            appContext,
-            false,
-            gattCallback,
-            BluetoothDevice.TRANSPORT_LE
-        )
+
+        val newGatt = try {
+            device.connectGatt(
+                appContext,
+                false,
+                gattCallback,
+                BluetoothDevice.TRANSPORT_LE
+            )
+        } catch (securityException: SecurityException) {
+            Log.e(tag, "[GATT] connectGatt() rechazado por permisos", securityException)
+            publishError("No se pudo abrir la conexión BLE por permisos.")
+            return
+        }
+
+        if (newGatt == null) {
+            Log.e(tag, "[GATT] connectGatt() devolvió null")
+            publishError("El sistema no pudo crear la conexión GATT.")
+            return
+        }
+        bluetoothGatt = newGatt
+        connectionTimeout = Runnable {
+            if (bluetoothGatt === newGatt &&
+                _connectionState.value.state == BleConnectionState.CONNECTING
+            ) {
+                Log.e(tag, "[GATT] Timeout esperando conexión/servicios, cerrando attempt=$attempt")
+                disconnectAndCloseGatt(newGatt)
+                publishError("Tiempo de espera agotado al conectar con el ESP32.")
+            }
+        }.also { mainHandler.postDelayed(it, GATT_TIMEOUT_MS) }
+        Log.d(tag, "[GATT] Objeto BluetoothGatt creado attempt=$attempt")
     }
 
     @SuppressLint("MissingPermission")
@@ -289,6 +432,14 @@ class BleConnectionManager(context: Context) {
         }
     }
 
+    private fun uuidMatches(actual: java.util.UUID, expected: java.util.UUID): Boolean =
+        actual.toString()
+            .filter(Char::isLetterOrDigit)
+            .equals(
+                expected.toString().filter(Char::isLetterOrDigit),
+                ignoreCase = true
+            )
+
     private fun processNotification(value: ByteArray) {
         lineBuffer.append(String(value, StandardCharsets.UTF_8))
 
@@ -301,6 +452,14 @@ class BleConnectionManager(context: Context) {
             parseSample(line)?.let {
                 _latestMeasurement.value = it
                 _measurements.tryEmit(it)
+                if (_connectionState.value.state == BleConnectionState.CONNECTED) {
+                    Log.d(
+                        tag,
+                        "[DATA] Medición válida recibida: tiempo_ms=${it.deviceTimeMs}, " +
+                            "valor_ADC=${it.adcValue}"
+                    )
+                    publishState(BleConnectionState.RECEIVING)
+                }
             }
         }
     }
@@ -323,16 +482,24 @@ class BleConnectionManager(context: Context) {
     @SuppressLint("MissingPermission")
     fun disconnect() {
         stopScanning()
-        bluetoothGatt?.disconnect()
-        if (bluetoothGatt == null) {
-            publishState(BleConnectionState.DISCONNECTED)
+        connectionAttemptId += 1
+        val gatt = bluetoothGatt
+        if (gatt != null) {
+            Log.d(tag, "[GATT] Cerrando conexión solicitada por el usuario")
+            try {
+                gatt.disconnect()
+            } finally {
+                closeGatt(gatt)
+            }
         }
+        lineBuffer.clear()
+        publishState(BleConnectionState.DISCONNECTED)
     }
 
     @SuppressLint("MissingPermission")
     fun close() {
         stopScanning()
-        closeGatt()
+        disconnectAndCloseGatt(bluetoothGatt)
         lineBuffer.clear()
         publishState(BleConnectionState.DISCONNECTED)
     }
@@ -344,17 +511,33 @@ class BleConnectionManager(context: Context) {
     }
 
     @SuppressLint("MissingPermission")
+    private fun disconnectAndCloseGatt(gatt: BluetoothGatt?) {
+        if (gatt == null) return
+        try {
+            gatt.disconnect()
+        } catch (_: SecurityException) {
+            Log.w(tag, "[GATT] No se pudo desconectar por permisos revocados")
+        }
+        closeGatt(gatt)
+    }
+
+    @SuppressLint("MissingPermission")
     private fun closeGatt(gatt: BluetoothGatt? = bluetoothGatt) {
         if (gatt == null) return
 
         if (bluetoothGatt === gatt) {
+            connectionTimeout?.let(mainHandler::removeCallbacks)
+            connectionTimeout = null
             bluetoothGatt = null
+            connectionAttemptId += 1
         }
 
         try {
+            Log.d(tag, "[GATT] BluetoothGatt.close() address=${gatt.device.address}")
             gatt.close()
         } catch (_: SecurityException) {
             // Permission may have been revoked while closing the connection.
+            Log.w(tag, "[GATT] No se pudo cerrar por permisos revocados")
         }
     }
 
@@ -374,22 +557,33 @@ class BleConnectionManager(context: Context) {
         }
     }
 
+    private fun publishDiscoveredDevice(device: BleDiscoveredDevice) {
+        val devices = (_connectionState.value.discoveredDevices
+            .filterNot { it.address == device.address } + device)
+            .sortedByDescending(BleDiscoveredDevice::rssi)
+        _connectionState.value = _connectionState.value.copy(discoveredDevices = devices)
+    }
+
     private fun publishState(
         state: BleConnectionState,
         deviceName: String? = _connectionState.value.deviceName
     ) {
-        _connectionState.value = BleConnectionUiState(state, deviceName, null)
+        _connectionState.value = _connectionState.value.copy(
+            state = state,
+            deviceName = deviceName,
+            errorMessage = null
+        )
     }
 
     private fun publishError(message: String) {
-        _connectionState.value = BleConnectionUiState(
+        _connectionState.value = _connectionState.value.copy(
             state = BleConnectionState.ERROR,
-            deviceName = _connectionState.value.deviceName,
             errorMessage = message
         )
     }
 
     companion object {
         private const val SCAN_DURATION_MS = 15_000L
+        private const val GATT_TIMEOUT_MS = 15_000L
     }
 }
