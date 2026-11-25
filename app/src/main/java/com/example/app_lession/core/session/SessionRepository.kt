@@ -59,6 +59,9 @@ class SessionRepository(private val sessionDao: SessionDao) {
             )
         }
 
+    suspend fun measurementsCsv(sessionId: Long): String =
+        SessionCsvFormatter.format(measurements(sessionId))
+
     private fun SessionEntity.toModel() = EmgSession(
         id = id,
         startedAtEpochMillis = startedAtEpochMillis,

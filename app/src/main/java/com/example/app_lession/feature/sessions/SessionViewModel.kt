@@ -127,6 +127,20 @@ class SessionViewModel(
         }
     }
 
+    suspend fun exportSessionCsv(sessionId: Long): String? {
+        _errorMessage.value = null
+        return try {
+            sessionRepository.measurementsCsv(sessionId)
+        } catch (error: SQLiteException) {
+            _errorMessage.value = "No se pudo leer la sesión para exportarla: ${error.message}"
+            null
+        }
+    }
+
+    fun reportExportError(message: String) {
+        _errorMessage.value = message
+    }
+
     fun closeSession() {
         _selectedSessionId.value = null
         measurementLoadJob?.cancel()
