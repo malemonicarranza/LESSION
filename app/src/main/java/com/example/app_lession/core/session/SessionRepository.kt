@@ -15,10 +15,37 @@ data class EmgSession(
     val sampleCount: Long
 )
 
+data class SessionStatistics(
+    val id: Long,
+    val startedAtEpochMillis: Long,
+    val endedAtEpochMillis: Long?,
+    val durationMillis: Long,
+    val sampleCount: Long,
+    val averageAdc: Double,
+    val minimumAdc: Int,
+    val maximumAdc: Int
+)
+
 class SessionRepository(private val sessionDao: SessionDao) {
     val sessions: Flow<List<EmgSession>> = sessionDao.observeSessions().map { sessions ->
         sessions.map { it.toModel() }
     }
+
+    val sessionStatistics: Flow<List<SessionStatistics>> =
+        sessionDao.observeSessionStatistics().map { rows ->
+            rows.map { row ->
+                SessionStatistics(
+                    id = row.id,
+                    startedAtEpochMillis = row.startedAtEpochMillis,
+                    endedAtEpochMillis = row.endedAtEpochMillis,
+                    durationMillis = row.durationMillis,
+                    sampleCount = row.measurementCount,
+                    averageAdc = row.averageAdc,
+                    minimumAdc = row.minimumAdc,
+                    maximumAdc = row.maximumAdc
+                )
+            }
+        }
 
     suspend fun getActiveSession(): EmgSession? =
         sessionDao.getActiveSession()?.toModel()

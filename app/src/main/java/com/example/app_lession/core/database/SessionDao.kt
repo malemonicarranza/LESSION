@@ -17,6 +17,17 @@ interface SessionDao {
     @Query("SELECT * FROM sessions ORDER BY startedAtEpochMillis DESC")
     fun observeSessions(): Flow<List<SessionEntity>>
 
+    @Query(
+        "SELECT s.id AS id, s.startedAtEpochMillis AS startedAtEpochMillis, " +
+            "s.endedAtEpochMillis AS endedAtEpochMillis, s.durationMillis AS durationMillis, " +
+            "COUNT(m.id) AS measurementCount, COALESCE(AVG(m.adcValue), 0.0) AS averageAdc, " +
+            "COALESCE(MIN(m.adcValue), 0) AS minimumAdc, " +
+            "COALESCE(MAX(m.adcValue), 0) AS maximumAdc " +
+            "FROM sessions AS s LEFT JOIN session_measurements AS m ON m.sessionId = s.id " +
+            "GROUP BY s.id ORDER BY s.startedAtEpochMillis"
+    )
+    fun observeSessionStatistics(): Flow<List<SessionStatisticsRow>>
+
     @Query("SELECT * FROM sessions WHERE id = :sessionId")
     suspend fun getSession(sessionId: Long): SessionEntity?
 

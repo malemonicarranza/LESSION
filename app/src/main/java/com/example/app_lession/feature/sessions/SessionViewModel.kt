@@ -9,6 +9,7 @@ import com.example.app_lession.core.database.AppDatabase
 import com.example.app_lession.core.model.EmgSample
 import com.example.app_lession.core.session.EmgSession
 import com.example.app_lession.core.session.SessionRepository
+import com.example.app_lession.core.session.SessionStatistics
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,6 +28,18 @@ class SessionViewModel(
     private var measurementLoadJob: Job? = null
     private val _sessions = MutableStateFlow<List<EmgSession>>(emptyList())
     val sessions = _sessions.asStateFlow()
+
+    private val _sessionStatistics = MutableStateFlow<List<SessionStatistics>>(emptyList())
+    val sessionStatistics = _sessionStatistics.asStateFlow()
+
+    private val _statisticsMeasurements =
+        MutableStateFlow<Map<Long, List<EmgSample>>>(emptyMap())
+    val statisticsMeasurements = _statisticsMeasurements.asStateFlow()
+
+    private val _loadingStatisticsSessions = MutableStateFlow<Set<Long>>(emptySet())
+    val loadingStatisticsSessions = _loadingStatisticsSessions.asStateFlow()
+
+    private val statisticsMeasurementJobs = mutableMapOf<Long, Job>()
 
     private val _activeSession = MutableStateFlow<EmgSession?>(null)
     val activeSession = _activeSession.asStateFlow()
@@ -51,6 +64,12 @@ class SessionViewModel(
             sessionRepository.sessions
                 .catch { error -> handleDatabaseError(error) }
                 .collect { _sessions.value = it }
+        }
+
+        viewModelScope.launch {
+            sessionRepository.sessionStatistics
+                .catch { error -> handleDatabaseError(error) }
+                .collect { _sessionStatistics.value = it }
         }
 
         viewModelScope.launch {
@@ -127,6 +146,30 @@ class SessionViewModel(
         }
     }
 
+    fun loadStatisticsMeasurements(sessionId: Long, refresh: Boolean = false) {
+        if (!refresh && _statisticsMeasurements.value.containsKey(sessionId)) return
+        if (statisticsMeasurementJobs[sessionId]?.isActive == true) return
+
+        _loadingStatisticsSessions.value = _loadingStatisticsSessions.value + sessionId
+        statisticsMeasurementJobs[sessionId] = viewModelScope.launch {
+            try {
+                val samples = sessionRepository.measurements(sessionId)
+                _statisticsMeasurements.value =
+                    (_statisticsMeasurements.value + (sessionId to samples))
+                        .entries
+                        .toList()
+                        .takeLast(MAX_CACHED_STATISTICS_SESSIONS)
+                        .associate { it.toPair() }
+            } catch (error: SQLiteException) {
+                _errorMessage.value = "No se pudieron cargar las estadísticas: ${error.message}"
+            } finally {
+                _loadingStatisticsSessions.value =
+                    _loadingStatisticsSessions.value - sessionId
+                statisticsMeasurementJobs.remove(sessionId)
+            }
+        }
+    }
+
     suspend fun exportSessionCsv(sessionId: Long): String? {
         _errorMessage.value = null
         return try {
@@ -181,5 +224,10 @@ class SessionViewModel(
             @Suppress("UNCHECKED_CAST")
             return SessionViewModel(repository, measurements) as T
         }
+
+    }
+
+    private companion object {
+        const val MAX_CACHED_STATISTICS_SESSIONS = 6
     }
 }

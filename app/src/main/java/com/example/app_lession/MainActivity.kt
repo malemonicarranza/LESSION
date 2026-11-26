@@ -25,6 +25,7 @@ import com.example.app_lession.feature.connection.ConnectionScreen
 import com.example.app_lession.feature.connection.ConnectionViewModel
 import com.example.app_lession.feature.sessions.SessionScreen
 import com.example.app_lession.feature.sessions.SessionViewModel
+import com.example.app_lession.feature.sessions.StatisticsScreen
 import com.example.app_lession.ui.theme.AppLessionTheme
 
 class MainActivity : ComponentActivity() {
@@ -132,8 +133,8 @@ fun AppLessionApp(
                     modifier = Modifier.padding(innerPadding)
                 )
             } else {
-                Text(
-                    text = "Esta sección se incorporará en una etapa posterior.",
+                StatisticsScreen(
+                    viewModel = sessionViewModel,
                     modifier = Modifier.padding(innerPadding)
                 )
             }
@@ -147,5 +148,5 @@ enum class AppDestinations(
 ) {
     HOME("Conexión", R.drawable.ic_home),
     FAVORITES("Sesiones", R.drawable.ic_favorite),
-    PROFILE("Configuración", R.drawable.ic_account_box),
+    PROFILE("Estadísticas", R.drawable.ic_chart),
 }
