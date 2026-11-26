@@ -1,6 +1,7 @@
 package com.example.app_lession.feature.connection
 
 import android.content.Context
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -61,6 +62,12 @@ class ConnectionViewModel(
                     sampleCount = current.sampleCount + 1,
                     approximateFrequencyHz = frequencyHz
                 )
+                Log.d(
+                    LIVE_DATA_TAG,
+                    "[UI_STATE] Muestra aplicada al gráfico: count=${current.sampleCount + 1}, " +
+                        "ADC=${sample.adcValue}, t_ms=${sample.deviceTimeMs}, " +
+                        "historial=${minOf(current.history.size + 1, HISTORY_CAPACITY)}"
+                )
             }
         }
     }
@@ -91,6 +98,7 @@ class ConnectionViewModel(
     }
 
     private companion object {
+        const val LIVE_DATA_TAG = "LessionLiveData"
         const val HISTORY_CAPACITY = 300
         const val FREQUENCY_WINDOW_MS = 2_000L
         const val FREQUENCY_WINDOW_CAPACITY = 128

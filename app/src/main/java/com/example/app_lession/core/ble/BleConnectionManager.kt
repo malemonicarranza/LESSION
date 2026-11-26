@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
@@ -18,10 +19,12 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.app_lession.core.model.EmgSample
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,7 +42,13 @@ class BleConnectionManager(context: Context) {
     private var bluetoothGatt: BluetoothGatt? = null
     private var scanTimeout: Runnable? = null
     private var connectionTimeout: Runnable? = null
+    private var notificationMonitor: Runnable? = null
     private var connectionAttemptId = 0L
+    private val txNotificationCount = AtomicLong(0L)
+    @Volatile
+    private var lastTxNotificationAtElapsedMs: Long? = null
+    @Volatile
+    private var txSubscriptionStartedAtElapsedMs: Long? = null
     private val discoveredBluetoothDevices = linkedMapOf<String, BluetoothDevice>()
     private val lineBuffer = StringBuilder()
 
@@ -229,11 +238,16 @@ class BleConnectionManager(context: Context) {
             }
             if (!uuidMatches(descriptor.uuid, BleUuids.CCCD)) return
 
-            Log.d(tag, "[GATT] onDescriptorWrite CCCD status=$status")
+            Log.d(
+                tag,
+                "[GATT] onDescriptorWrite CCCD status=$status " +
+                    "value=${descriptor.value?.joinToString(" ") { "%02X".format(it) }}"
+            )
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 connectionTimeout?.let(mainHandler::removeCallbacks)
                 connectionTimeout = null
-                Log.d(tag, "CCCD TX habilitado correctamente")
+                Log.i(tag, "[GATT_SUBSCRIPTION] CCCD TX confirmado por Android")
+                startNotificationDiagnostics(gatt)
                 publishState(BleConnectionState.CONNECTED, gatt.device.name)
             } else {
                 closeGatt(gatt)
@@ -247,9 +261,11 @@ class BleConnectionManager(context: Context) {
             characteristic: BluetoothGattCharacteristic
         ) {
             if (bluetoothGatt !== gatt) return
+            logCharacteristicNotification(characteristic.uuid, characteristic.value)
             if (uuidMatches(characteristic.uuid, BleUuids.TX)) {
-                Log.d(tag, "[GATT] Notificación TX recibida (${characteristic.value.size} bytes)")
                 processNotification(characteristic.value)
+            } else {
+                Log.w(tag, "[BLE_NOTIFY] Notificación ignorada: UUID no corresponde a TX")
             }
         }
 
@@ -259,9 +275,11 @@ class BleConnectionManager(context: Context) {
             value: ByteArray
         ) {
             if (bluetoothGatt !== gatt) return
+            logCharacteristicNotification(characteristic.uuid, value)
             if (uuidMatches(characteristic.uuid, BleUuids.TX)) {
-                Log.d(tag, "[GATT] Notificación TX recibida (${value.size} bytes)")
                 processNotification(value)
+            } else {
+                Log.w(tag, "[BLE_NOTIFY] Notificación ignorada: UUID no corresponde a TX")
             }
         }
     }
@@ -412,24 +430,87 @@ class BleConnectionManager(context: Context) {
         tx: BluetoothGattCharacteristic,
         cccd: BluetoothGattDescriptor
     ) {
-        Log.d(tag, "Activando notificaciones TX")
-        if (!gatt.setCharacteristicNotification(tx, true)) {
+        Log.d(tag, "[GATT_SUBSCRIPTION] Solicitando notificaciones locales para TX=${tx.uuid}")
+        val localNotificationEnabled = gatt.setCharacteristicNotification(tx, true)
+        Log.d(tag, "[GATT_SUBSCRIPTION] setCharacteristicNotification result=$localNotificationEnabled")
+        if (!localNotificationEnabled) {
             closeGatt(gatt)
             publishError("No se pudo preparar la suscripción a TX.")
             return
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeDescriptor(
-                cccd,
-                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            )
+        val cccdValue = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        val descriptorWriteStarted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val result = gatt.writeDescriptor(cccd, cccdValue)
+            Log.d(tag, "[GATT_SUBSCRIPTION] writeDescriptor API33+ result=$result")
+            result == BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
-            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            cccd.value = cccdValue
             @Suppress("DEPRECATION")
-            gatt.writeDescriptor(cccd)
+            val result = gatt.writeDescriptor(cccd)
+            Log.d(tag, "[GATT_SUBSCRIPTION] writeDescriptor legacy queued=$result")
+            result
         }
+        if (!descriptorWriteStarted) {
+            Log.e(tag, "[GATT_SUBSCRIPTION] No se pudo iniciar la escritura del CCCD")
+            closeGatt(gatt)
+            publishError("No se pudo iniciar la suscripción a notificaciones TX.")
+        }
+    }
+
+    private fun startNotificationDiagnostics(gatt: BluetoothGatt) {
+        stopNotificationDiagnostics()
+        txNotificationCount.set(0L)
+        lastTxNotificationAtElapsedMs = null
+        txSubscriptionStartedAtElapsedMs = SystemClock.elapsedRealtime()
+        Log.i(tag, "[BLE_NOTIFY_MONITOR] Suscripción TX activa; monitoreo cada ${NOTIFICATION_MONITOR_INTERVAL_MS}ms")
+
+        val monitor = object : Runnable {
+            private var previousCount = 0L
+            private var previousReportAtMs = SystemClock.elapsedRealtime()
+
+            override fun run() {
+                if (bluetoothGatt !== gatt) return
+
+                val now = SystemClock.elapsedRealtime()
+                val count = txNotificationCount.get()
+                val delta = count - previousCount
+                val intervalMs = (now - previousReportAtMs).coerceAtLeast(1L)
+                val rateHz = delta * 1000.0 / intervalMs
+                val lastAtMs = lastTxNotificationAtElapsedMs
+                val ageMs = lastAtMs?.let { now - it }
+                val subscribedForMs = txSubscriptionStartedAtElapsedMs?.let { now - it }
+
+                if (delta == 0L) {
+                    Log.w(
+                        tag,
+                        "[BLE_NOTIFY_MONITOR] Sin callbacks TX en los últimos ${intervalMs}ms; " +
+                            "total=$count, última_muestra_hace_ms=${ageMs ?: "nunca"}, " +
+                            "suscripción_activa_hace_ms=$subscribedForMs"
+                    )
+                } else {
+                    Log.i(
+                        tag,
+                        "[BLE_NOTIFY_MONITOR] callbacks_TX=$count, recibidos_en_intervalo=$delta, " +
+                            "frecuencia_aprox=${"%.1f".format(java.util.Locale.US, rateHz)}Hz, " +
+                            "última_muestra_hace_ms=$ageMs"
+                    )
+                }
+
+                previousCount = count
+                previousReportAtMs = now
+                mainHandler.postDelayed(this, NOTIFICATION_MONITOR_INTERVAL_MS)
+            }
+        }
+        notificationMonitor = monitor
+        mainHandler.postDelayed(monitor, NOTIFICATION_MONITOR_INTERVAL_MS)
+    }
+
+    private fun stopNotificationDiagnostics() {
+        notificationMonitor?.let(mainHandler::removeCallbacks)
+        notificationMonitor = null
+        txSubscriptionStartedAtElapsedMs = null
     }
 
     private fun uuidMatches(actual: java.util.UUID, expected: java.util.UUID): Boolean =
@@ -441,7 +522,8 @@ class BleConnectionManager(context: Context) {
             )
 
     private fun processNotification(value: ByteArray) {
-        lineBuffer.append(String(value, StandardCharsets.UTF_8))
+        val receivedText = String(value, StandardCharsets.UTF_8)
+        lineBuffer.append(receivedText)
 
         while (true) {
             val lineEnd = lineBuffer.indexOf("\n")
@@ -449,19 +531,47 @@ class BleConnectionManager(context: Context) {
 
             val line = lineBuffer.substring(0, lineEnd).trimEnd('\r')
             lineBuffer.delete(0, lineEnd + 1)
-            parseSample(line)?.let {
+            Log.d(tag, "[BLE_LINE] Registro completo recibido: \"$line\"")
+            val sample = parseSample(line)
+            if (sample == null) {
+                Log.w(tag, "[BLE_PARSE] Registro descartado: \"$line\"")
+            } else {
+                Log.d(
+                    tag,
+                    "[BLE_PARSE] ADC parseado=${sample.adcValue}, " +
+                        "t_ms=${sample.deviceTimeMs}, recibido_en=${sample.receivedAtEpochMillis}"
+                )
+            }
+            sample?.let {
                 _latestMeasurement.value = it
-                _measurements.tryEmit(it)
+                val emitted = _measurements.tryEmit(it)
+                Log.d(tag, "[BLE_FLOW] Muestra publicada al flujo=$emitted")
                 if (_connectionState.value.state == BleConnectionState.CONNECTED) {
-                    Log.d(
-                        tag,
-                        "[DATA] Medición válida recibida: tiempo_ms=${it.deviceTimeMs}, " +
-                            "valor_ADC=${it.adcValue}"
-                    )
                     publishState(BleConnectionState.RECEIVING)
                 }
             }
         }
+    }
+
+    private fun logCharacteristicNotification(uuid: java.util.UUID, value: ByteArray) {
+        val isTx = uuidMatches(uuid, BleUuids.TX)
+        val notificationNumber = if (isTx) {
+            lastTxNotificationAtElapsedMs = SystemClock.elapsedRealtime()
+            txNotificationCount.incrementAndGet()
+        } else {
+            null
+        }
+        val payload = String(value, StandardCharsets.UTF_8)
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+        val hex = value.joinToString(" ") { byte -> "%02X".format(byte) }
+        Log.d(
+            tag,
+            "[BLE_NOTIFY_CALLBACK] uuid=$uuid expectedTX=${BleUuids.TX} " +
+                "tx=${isTx} txCallbackNumber=$notificationNumber " +
+                "elapsedRealtimeMs=${SystemClock.elapsedRealtime()} " +
+                "bytes=${value.size} payload=\"$payload\" hex=$hex"
+        )
     }
 
     private fun parseSample(line: String): EmgSample? {
@@ -526,6 +636,7 @@ class BleConnectionManager(context: Context) {
         if (gatt == null) return
 
         if (bluetoothGatt === gatt) {
+            stopNotificationDiagnostics()
             connectionTimeout?.let(mainHandler::removeCallbacks)
             connectionTimeout = null
             bluetoothGatt = null
@@ -585,5 +696,6 @@ class BleConnectionManager(context: Context) {
     companion object {
         private const val SCAN_DURATION_MS = 15_000L
         private const val GATT_TIMEOUT_MS = 15_000L
+        private const val NOTIFICATION_MONITOR_INTERVAL_MS = 5_000L
     }
 }

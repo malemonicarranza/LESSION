@@ -31,24 +31,24 @@ class SessionRepository(private val sessionDao: SessionDao) {
         sessions.map { it.toModel() }
     }
 
-    val sessionStatistics: Flow<List<SessionStatistics>> =
-        sessionDao.observeSessionStatistics().map { rows ->
-            rows.map { row ->
-                SessionStatistics(
-                    id = row.id,
-                    startedAtEpochMillis = row.startedAtEpochMillis,
-                    endedAtEpochMillis = row.endedAtEpochMillis,
-                    durationMillis = row.durationMillis,
-                    sampleCount = row.measurementCount,
-                    averageAdc = row.averageAdc,
-                    minimumAdc = row.minimumAdc,
-                    maximumAdc = row.maximumAdc
-                )
-            }
+    suspend fun sessionStatistics(): List<SessionStatistics> =
+        sessionDao.getSessionStatistics().map { row ->
+            SessionStatistics(
+                id = row.id,
+                startedAtEpochMillis = row.startedAtEpochMillis,
+                endedAtEpochMillis = row.endedAtEpochMillis,
+                durationMillis = row.durationMillis,
+                sampleCount = row.measurementCount,
+                averageAdc = row.averageAdc,
+                minimumAdc = row.minimumAdc,
+                maximumAdc = row.maximumAdc
+            )
         }
 
     suspend fun getActiveSession(): EmgSession? =
-        sessionDao.getActiveSession()?.toModel()
+        sessionDao.getActiveSession()?.let { session ->
+            session.toModel().copy(sampleCount = sessionDao.getMeasurementCount(session.id))
+        }
 
     suspend fun startSession(startedAtEpochMillis: Long): EmgSession? {
         val sessionId = sessionDao.createSessionIfNoneActive(
@@ -57,7 +57,7 @@ class SessionRepository(private val sessionDao: SessionDao) {
         return sessionDao.getSession(sessionId)?.toModel()
     }
 
-    suspend fun recordMeasurement(sessionId: Long, sample: EmgSample) {
+    suspend fun recordMeasurement(sessionId: Long, sample: EmgSample): Boolean =
         sessionDao.insertMeasurementIfActive(
             SessionMeasurementEntity(
                 sessionId = sessionId,
@@ -66,7 +66,6 @@ class SessionRepository(private val sessionDao: SessionDao) {
                 receivedAtEpochMillis = sample.receivedAtEpochMillis
             )
         )
-    }
 
     suspend fun finishSession(session: EmgSession, endedAtEpochMillis: Long): EmgSession? {
         sessionDao.finishSession(

@@ -26,7 +26,7 @@ interface SessionDao {
             "FROM sessions AS s LEFT JOIN session_measurements AS m ON m.sessionId = s.id " +
             "GROUP BY s.id ORDER BY s.startedAtEpochMillis"
     )
-    fun observeSessionStatistics(): Flow<List<SessionStatisticsRow>>
+    suspend fun getSessionStatistics(): List<SessionStatisticsRow>
 
     @Query("SELECT * FROM sessions WHERE id = :sessionId")
     suspend fun getSession(sessionId: Long): SessionEntity?
@@ -37,17 +37,14 @@ interface SessionDao {
     )
     suspend fun getActiveSession(): SessionEntity?
 
+    @Query("SELECT COUNT(*) FROM session_measurements WHERE sessionId = :sessionId")
+    suspend fun getMeasurementCount(sessionId: Long): Long
+
     @Query(
         "SELECT * FROM session_measurements WHERE sessionId = :sessionId " +
             "ORDER BY receivedAtEpochMillis, id"
     )
     suspend fun getMeasurements(sessionId: Long): List<SessionMeasurementEntity>
-
-    @Query(
-        "UPDATE sessions SET sampleCount = sampleCount + 1 " +
-            "WHERE id = :sessionId AND endedAtEpochMillis IS NULL"
-    )
-    suspend fun incrementSampleCount(sessionId: Long)
 
     @Query(
         "UPDATE sessions SET endedAtEpochMillis = :endedAtEpochMillis, " +
@@ -73,7 +70,6 @@ interface SessionDao {
         val session = getSession(measurement.sessionId) ?: return false
         if (session.endedAtEpochMillis != null) return false
         insertMeasurement(measurement)
-        incrementSampleCount(measurement.sessionId)
         return true
     }
 }

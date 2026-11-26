@@ -26,6 +26,7 @@ class SessionViewModel(
 ) : ViewModel() {
     private val recordingMutex = Mutex()
     private var measurementLoadJob: Job? = null
+    private var statisticsLoadJob: Job? = null
     private val _sessions = MutableStateFlow<List<EmgSession>>(emptyList())
     val sessions = _sessions.asStateFlow()
 
@@ -67,21 +68,31 @@ class SessionViewModel(
         }
 
         viewModelScope.launch {
-            sessionRepository.sessionStatistics
-                .catch { error -> handleDatabaseError(error) }
-                .collect { _sessionStatistics.value = it }
-        }
-
-        viewModelScope.launch {
             try {
                 recordingMutex.withLock {
                     _activeSession.value = sessionRepository.getActiveSession()
                     _isInitializing.value = false
                 }
+                var activeSessionId: Long? = null
+                var recordedSampleCount = 0L
+                var lastSessionUiUpdateAt = 0L
                 measurements.collect { sample ->
                     recordingMutex.withLock {
                         _activeSession.value?.let { active ->
-                            sessionRepository.recordMeasurement(active.id, sample)
+                            if (active.id != activeSessionId) {
+                                activeSessionId = active.id
+                                recordedSampleCount = active.sampleCount
+                                lastSessionUiUpdateAt = 0L
+                            }
+                            if (sessionRepository.recordMeasurement(active.id, sample)) {
+                                recordedSampleCount += 1
+                                val now = System.currentTimeMillis()
+                                if (now - lastSessionUiUpdateAt >= SESSION_UI_UPDATE_INTERVAL_MS) {
+                                    _activeSession.value =
+                                        active.copy(sampleCount = recordedSampleCount)
+                                    lastSessionUiUpdateAt = now
+                                }
+                            }
                         }
                     }
                 }
@@ -143,6 +154,19 @@ class SessionViewModel(
     fun refreshSessionMeasurements() {
         _selectedSessionId.value?.let { sessionId ->
             loadMeasurements(sessionId)
+        }
+    }
+
+    fun refreshSessionStatistics() {
+        if (statisticsLoadJob?.isActive == true) return
+        statisticsLoadJob = viewModelScope.launch {
+            try {
+                _sessionStatistics.value = sessionRepository.sessionStatistics()
+            } catch (error: SQLiteException) {
+                _errorMessage.value = "No se pudieron leer las estadísticas: ${error.message}"
+            } finally {
+                statisticsLoadJob = null
+            }
         }
     }
 
@@ -229,5 +253,6 @@ class SessionViewModel(
 
     private companion object {
         const val MAX_CACHED_STATISTICS_SESSIONS = 6
+        const val SESSION_UI_UPDATE_INTERVAL_MS = 500L
     }
 }
